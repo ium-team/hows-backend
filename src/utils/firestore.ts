@@ -15,25 +15,19 @@ export const ensureMember = async (
 ): Promise<void> => {
   await ensureClubExists(db, clubId);
 
-  // Fast path: trust club.memberIds when member documents are legacy/inconsistent.
-  const clubDoc = await db.collection("clubs").doc(clubId).get();
-  const clubData = clubDoc.data() as { memberIds?: unknown } | undefined;
-  const memberIds = Array.isArray(clubData?.memberIds)
-    ? clubData.memberIds.filter((id): id is string => typeof id === "string")
-    : [];
-  if (memberIds.includes(userId)) {
-    return;
-  }
-
   const members = db.collection("clubs").doc(clubId).collection("members");
   const directDoc = await members.doc(userId).get();
   if (directDoc.exists) {
-    return;
+    const data = directDoc.data() as { approved?: unknown } | undefined;
+    if (data?.approved === true) {
+      return;
+    }
+    throw notMemberError();
   }
 
   const [byUserId, byUid] = await Promise.all([
-    members.where("userId", "==", userId).limit(1).get(),
-    members.where("uid", "==", userId).limit(1).get(),
+    members.where("userId", "==", userId).where("approved", "==", true).limit(1).get(),
+    members.where("uid", "==", userId).where("approved", "==", true).limit(1).get(),
   ]);
 
   if (!byUserId.empty || !byUid.empty) {
