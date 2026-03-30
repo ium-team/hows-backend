@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildApp = void 0;
 const fastify_1 = __importDefault(require("fastify"));
+const cors_1 = __importDefault(require("@fastify/cors"));
 const zod_1 = require("zod");
 const admin_1 = require("./firebase/admin");
 const routes_1 = require("./routes");
@@ -22,6 +23,9 @@ const getTokenFromAuthHeader = (authorization) => {
 const buildApp = () => {
     (0, admin_1.initFirebaseAdmin)();
     const app = (0, fastify_1.default)({ logger: true });
+    void app.register(cors_1.default, {
+        origin: process.env.CORS_ORIGIN?.trim() || true,
+    });
     app.decorate("authenticate", async (request, _reply) => {
         const token = getTokenFromAuthHeader(request.headers.authorization);
         if (!token) {

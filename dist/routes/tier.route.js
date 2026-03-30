@@ -14,6 +14,10 @@ const explainSchema = zod_1.z.object({
     userId: zod_1.z.string().min(1),
     tierType: zod_1.z.enum(["overall", "dribble", "shoot"]).default("overall"),
 });
+const boardSchema = zod_1.z.object({
+    clubId: zod_1.z.string().min(1),
+    topicId: zod_1.z.string().min(1).default("default"),
+});
 const registerTierRoutes = async (fastify) => {
     fastify.post("/compute", async (request) => {
         const body = computeSchema.parse(request.body);
@@ -25,6 +29,11 @@ const registerTierRoutes = async (fastify) => {
         const query = explainSchema.parse(request.query);
         await (0, firestore_1.ensureMember)((0, admin_1.getDb)(), query.clubId, request.userId);
         return (0, tier_service_1.getTierExplain)(query.clubId, query.userId, query.tierType);
+    });
+    fastify.post("/board", async (request) => {
+        const body = boardSchema.parse(request.body);
+        await (0, firestore_1.ensureMember)((0, admin_1.getDb)(), body.clubId, request.userId);
+        return (0, tier_service_1.computeTierBoard)(body.clubId, body.topicId);
     });
 };
 exports.registerTierRoutes = registerTierRoutes;
