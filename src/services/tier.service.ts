@@ -170,7 +170,7 @@ const withComputationLock = async <T>(
 };
 
 const getApprovedMembers = async (clubId: string): Promise<ApprovedMember[]> => {
-  const membersSnap = await getDb().collection("clubs").doc(clubId).collection("members").orderBy("requestedAt", "desc").get();
+  const membersSnap = await getDb().collection("clubs").doc(clubId).collection("members").get();
 
   return membersSnap.docs
     .map((doc) => {

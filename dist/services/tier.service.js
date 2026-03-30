@@ -111,7 +111,7 @@ const withComputationLock = async (clubId, tierType, task) => {
     }
 };
 const getApprovedMembers = async (clubId) => {
-    const membersSnap = await (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("members").orderBy("requestedAt", "desc").get();
+    const membersSnap = await (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("members").get();
     return membersSnap.docs
         .map((doc) => {
         const data = doc.data();
