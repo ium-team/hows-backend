@@ -23,8 +23,25 @@ const getTokenFromAuthHeader = (authorization) => {
 const buildApp = () => {
     (0, admin_1.initFirebaseAdmin)();
     const app = (0, fastify_1.default)({ logger: true });
+    const normalizeOrigin = (origin) => origin.trim().replace(/\/+$/, "");
+    const configuredOrigins = (process.env.CORS_ORIGIN ?? "")
+        .split(",")
+        .map((origin) => normalizeOrigin(origin))
+        .filter(Boolean);
     void app.register(cors_1.default, {
-        origin: process.env.CORS_ORIGIN?.trim() || true,
+        origin: (origin, callback) => {
+            if (!origin) {
+                callback(null, true);
+                return;
+            }
+            if (configuredOrigins.length === 0) {
+                callback(null, true);
+                return;
+            }
+            callback(null, configuredOrigins.includes(normalizeOrigin(origin)));
+        },
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Authorization", "Content-Type"],
     });
     app.decorate("authenticate", async (request, _reply) => {
         const token = getTokenFromAuthHeader(request.headers.authorization);

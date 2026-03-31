@@ -20,8 +20,29 @@ export const buildApp = (): FastifyInstance => {
   initFirebaseAdmin();
 
   const app = Fastify({ logger: true });
+
+  const normalizeOrigin = (origin: string): string => origin.trim().replace(/\/+$/, "");
+  const configuredOrigins = (process.env.CORS_ORIGIN ?? "")
+    .split(",")
+    .map((origin) => normalizeOrigin(origin))
+    .filter(Boolean);
+
   void app.register(cors, {
-    origin: process.env.CORS_ORIGIN?.trim() || true,
+    origin: (origin, callback) => {
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+
+      if (configuredOrigins.length === 0) {
+        callback(null, true);
+        return;
+      }
+
+      callback(null, configuredOrigins.includes(normalizeOrigin(origin)));
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Authorization", "Content-Type"],
   });
 
   app.decorate(
