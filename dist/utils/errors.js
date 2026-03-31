@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.notMemberError = exports.clubNotFoundError = exports.invalidRequestError = exports.unauthorizedError = exports.AppError = void 0;
+exports.notOwnerError = exports.notMemberError = exports.clubNotFoundError = exports.invalidRequestError = exports.unauthorizedError = exports.AppError = void 0;
 class AppError extends Error {
     code;
     statusCode;
@@ -19,3 +19,5 @@ const clubNotFoundError = () => new AppError("CLUB_NOT_FOUND", 404);
 exports.clubNotFoundError = clubNotFoundError;
 const notMemberError = () => new AppError("NOT_MEMBER", 403);
 exports.notMemberError = notMemberError;
+const notOwnerError = () => new AppError("NOT_OWNER", 403);
+exports.notOwnerError = notOwnerError;

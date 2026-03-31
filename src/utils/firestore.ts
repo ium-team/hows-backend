@@ -1,5 +1,5 @@
 import { Firestore } from "firebase-admin/firestore";
-import { clubNotFoundError, notMemberError } from "./errors";
+import { clubNotFoundError, notMemberError, notOwnerError } from "./errors";
 
 export const ensureClubExists = async (db: Firestore, clubId: string): Promise<void> => {
   const clubDoc = await db.collection("clubs").doc(clubId).get();
@@ -35,4 +35,13 @@ export const ensureMember = async (
   }
 
   throw notMemberError();
+};
+
+export const ensureOwner = async (db: Firestore, clubId: string, userId: string): Promise<void> => {
+  await ensureClubExists(db, clubId);
+  const clubDoc = await db.collection("clubs").doc(clubId).get();
+  const ownerId = clubDoc.data()?.ownerId;
+  if (typeof ownerId !== "string" || ownerId !== userId) {
+    throw notOwnerError();
+  }
 };

@@ -1,6 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { ensureMember } from "../utils/firestore";
+import { ensureMember, ensureOwner } from "../utils/firestore";
 import { getDb } from "../firebase/admin";
 import {
   computeTier,
@@ -56,7 +56,7 @@ export const registerTierRoutes = async (fastify: FastifyInstance) => {
 
   fastify.post("/recompute", async (request) => {
     const body = recomputeSchema.parse(request.body);
-    await ensureMember(getDb(), body.clubId, request.userId!);
+    await ensureOwner(getDb(), body.clubId, request.userId!);
     return recomputeClubTierSnapshots(body.clubId, body.topicId);
   });
 };

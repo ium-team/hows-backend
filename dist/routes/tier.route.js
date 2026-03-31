@@ -41,7 +41,7 @@ const registerTierRoutes = async (fastify) => {
     });
     fastify.post("/recompute", async (request) => {
         const body = recomputeSchema.parse(request.body);
-        await (0, firestore_1.ensureMember)((0, admin_1.getDb)(), body.clubId, request.userId);
+        await (0, firestore_1.ensureOwner)((0, admin_1.getDb)(), body.clubId, request.userId);
         return (0, tier_service_1.recomputeClubTierSnapshots)(body.clubId, body.topicId);
     });
 };

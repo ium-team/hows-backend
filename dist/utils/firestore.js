@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ensureMember = exports.ensureClubExists = void 0;
+exports.ensureOwner = exports.ensureMember = exports.ensureClubExists = void 0;
 const errors_1 = require("./errors");
 const ensureClubExists = async (db, clubId) => {
     const clubDoc = await db.collection("clubs").doc(clubId).get();
@@ -30,3 +30,12 @@ const ensureMember = async (db, clubId, userId) => {
     throw (0, errors_1.notMemberError)();
 };
 exports.ensureMember = ensureMember;
+const ensureOwner = async (db, clubId, userId) => {
+    await (0, exports.ensureClubExists)(db, clubId);
+    const clubDoc = await db.collection("clubs").doc(clubId).get();
+    const ownerId = clubDoc.data()?.ownerId;
+    if (typeof ownerId !== "string" || ownerId !== userId) {
+        throw (0, errors_1.notOwnerError)();
+    }
+};
+exports.ensureOwner = ensureOwner;
