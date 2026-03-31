@@ -2,7 +2,13 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { ensureMember } from "../utils/firestore";
 import { getDb } from "../firebase/admin";
-import { computeTier, computeTierBoard, getTierExplain, TierType } from "../services/tier.service";
+import {
+  computeTier,
+  computeTierBoard,
+  getTierExplain,
+  recomputeClubTierSnapshots,
+  TierType,
+} from "../services/tier.service";
 
 const computeSchema = z.object({
   clubId: z.string().min(1),
@@ -18,6 +24,11 @@ const explainSchema = z.object({
 const boardSchema = z.object({
   clubId: z.string().min(1),
   topicId: z.string().min(1).default("default"),
+});
+
+const recomputeSchema = z.object({
+  clubId: z.string().min(1),
+  topicId: z.string().min(1).optional(),
 });
 
 export const registerTierRoutes = async (fastify: FastifyInstance) => {
@@ -41,5 +52,11 @@ export const registerTierRoutes = async (fastify: FastifyInstance) => {
     await ensureMember(getDb(), body.clubId, request.userId!);
 
     return computeTierBoard(body.clubId, body.topicId);
+  });
+
+  fastify.post("/recompute", async (request) => {
+    const body = recomputeSchema.parse(request.body);
+    await ensureMember(getDb(), body.clubId, request.userId!);
+    return recomputeClubTierSnapshots(body.clubId, body.topicId);
   });
 };

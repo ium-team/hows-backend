@@ -10,6 +10,7 @@ export type ComputedTier = {
   scores: Record<string, number>;
   tiers: Record<string, string[]>;
   updatedAt: Date;
+  version: number;
 };
 
 type ParsedTierEntry = {
@@ -96,6 +97,9 @@ const parseTierListDoc = (payload: unknown): ParsedTierEntry[] => {
 const getTierCacheDocRef = (clubId: string, tierType: TierType) =>
   getDb().collection("clubs").doc(clubId).collection("computedTier").doc(tierType);
 
+const getTierBoardDocRef = (clubId: string, topicId: string) =>
+  getDb().collection("clubs").doc(clubId).collection("computedTierBoard").doc(topicId);
+
 const getTierLockDocRef = (clubId: string, tierType: TierType) =>
   getDb().collection("clubs").doc(clubId).collection("computedTierLocks").doc(tierType);
 
@@ -115,7 +119,7 @@ const readCached = async (clubId: string, tierType: TierType): Promise<ComputedT
     return null;
   }
 
-  const data = snap.data() as Partial<ComputedTier> & { updatedAt?: unknown };
+  const data = snap.data() as Partial<ComputedTier> & { updatedAt?: unknown; version?: unknown };
   if (!data?.scores || !data.tiers || !data.updatedAt) {
     return null;
   }
@@ -130,6 +134,7 @@ const readCached = async (clubId: string, tierType: TierType): Promise<ComputedT
     scores: data.scores,
     tiers: data.tiers,
     updatedAt,
+    version: typeof data.version === "number" ? data.version : 0,
   };
 };
 
@@ -474,6 +479,7 @@ export const computeTier = async (
       scores,
       tiers,
       updatedAt: new Date(),
+      version: Date.now(),
     };
 
     await getTierCacheDocRef(clubId, tierType).set({
@@ -514,6 +520,36 @@ export const computeTierBoard = async (clubId: string, topicId = "default") => {
   }
 
   return { board };
+};
+
+export const computeAndStoreTierBoard = async (clubId: string, topicId = "default") => {
+  const result = await computeTierBoard(clubId, topicId);
+  const now = new Date();
+  await getTierBoardDocRef(clubId, topicId).set({
+    topicId,
+    board: result.board,
+    updatedAt: Timestamp.fromDate(now),
+    version: Date.now(),
+  });
+  return result;
+};
+
+export const recomputeClubTierSnapshots = async (clubId: string, topicId?: string) => {
+  await ensureClubExists(getDb(), clubId);
+
+  const tierTypes: TierType[] = ["overall", "dribble", "shoot"];
+  await Promise.all(tierTypes.map((type) => computeTier(clubId, type, { force: true })));
+
+  if (topicId) {
+    await computeAndStoreTierBoard(clubId, topicId);
+    return { updatedTierTypes: tierTypes, updatedBoards: [topicId] };
+  }
+
+  const topicSnap = await getDb().collection("clubs").doc(clubId).collection("tierTopics").get();
+  const topicIds = Array.from(new Set(["default", ...topicSnap.docs.map((doc) => doc.id)]));
+  await Promise.all(topicIds.map((id) => computeAndStoreTierBoard(clubId, id)));
+
+  return { updatedTierTypes: tierTypes, updatedBoards: topicIds };
 };
 
 export const getTierExplain = async (clubId: string, userId: string, tierType: TierType) => {

@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getTierExplain = exports.computeTierBoard = exports.computeTier = void 0;
+exports.getTierExplain = exports.recomputeClubTierSnapshots = exports.computeAndStoreTierBoard = exports.computeTierBoard = exports.computeTier = void 0;
 const firestore_1 = require("firebase-admin/firestore");
 const admin_1 = require("../firebase/admin");
 const firestore_2 = require("../utils/firestore");
@@ -53,6 +53,7 @@ const parseTierListDoc = (payload) => {
     return rows;
 };
 const getTierCacheDocRef = (clubId, tierType) => (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("computedTier").doc(tierType);
+const getTierBoardDocRef = (clubId, topicId) => (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("computedTierBoard").doc(topicId);
 const getTierLockDocRef = (clubId, tierType) => (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("computedTierLocks").doc(tierType);
 const parseUpdatedAt = (value) => {
     if (value instanceof firestore_1.Timestamp) {
@@ -81,6 +82,7 @@ const readCached = async (clubId, tierType) => {
         scores: data.scores,
         tiers: data.tiers,
         updatedAt,
+        version: typeof data.version === "number" ? data.version : 0,
     };
 };
 const withComputationLock = async (clubId, tierType, task) => {
@@ -338,6 +340,7 @@ const computeTier = async (clubId, tierType, options) => {
             scores,
             tiers,
             updatedAt: new Date(),
+            version: Date.now(),
         };
         await getTierCacheDocRef(clubId, tierType).set({
             ...computed,
@@ -372,6 +375,32 @@ const computeTierBoard = async (clubId, topicId = "default") => {
     return { board };
 };
 exports.computeTierBoard = computeTierBoard;
+const computeAndStoreTierBoard = async (clubId, topicId = "default") => {
+    const result = await (0, exports.computeTierBoard)(clubId, topicId);
+    const now = new Date();
+    await getTierBoardDocRef(clubId, topicId).set({
+        topicId,
+        board: result.board,
+        updatedAt: firestore_1.Timestamp.fromDate(now),
+        version: Date.now(),
+    });
+    return result;
+};
+exports.computeAndStoreTierBoard = computeAndStoreTierBoard;
+const recomputeClubTierSnapshots = async (clubId, topicId) => {
+    await (0, firestore_2.ensureClubExists)((0, admin_1.getDb)(), clubId);
+    const tierTypes = ["overall", "dribble", "shoot"];
+    await Promise.all(tierTypes.map((type) => (0, exports.computeTier)(clubId, type, { force: true })));
+    if (topicId) {
+        await (0, exports.computeAndStoreTierBoard)(clubId, topicId);
+        return { updatedTierTypes: tierTypes, updatedBoards: [topicId] };
+    }
+    const topicSnap = await (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("tierTopics").get();
+    const topicIds = Array.from(new Set(["default", ...topicSnap.docs.map((doc) => doc.id)]));
+    await Promise.all(topicIds.map((id) => (0, exports.computeAndStoreTierBoard)(clubId, id)));
+    return { updatedTierTypes: tierTypes, updatedBoards: topicIds };
+};
+exports.recomputeClubTierSnapshots = recomputeClubTierSnapshots;
 const getTierExplain = async (clubId, userId, tierType) => {
     const db = (0, admin_1.getDb)();
     const computed = await (0, exports.computeTier)(clubId, tierType);
