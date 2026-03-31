@@ -238,6 +238,55 @@ const buildTierSkillMap = (tierPayloads: unknown[], memberSet: Set<string>) => {
   return skillMap;
 };
 
+const parseTopicWeight = (rawWeight: unknown) => {
+  const weight = Number(rawWeight);
+  if (!Number.isFinite(weight) || weight < 0) {
+    return 1;
+  }
+  return weight;
+};
+
+const buildWeightedOtherTopicSkillMap = async (
+  clubId: string,
+  memberSet: Set<string>,
+  topicDocs: FirebaseFirestore.QueryDocumentSnapshot<FirebaseFirestore.DocumentData>[],
+) => {
+  const weightedByMember = new Map<string, { weightedSum: number; weightSum: number }>();
+  const additionalTopicDocs = topicDocs.filter((topicDoc) => topicDoc.id !== "default");
+  if (!additionalTopicDocs.length) {
+    return new Map<string, number>();
+  }
+
+  const perTopicSkillRows = await Promise.all(
+    additionalTopicDocs.map(async (topicDoc) => {
+      const payloads = await getTierListPayloadsByTopic(clubId, topicDoc.id);
+      const skillMap = buildTierSkillMap(payloads, memberSet);
+      const topicWeight = parseTopicWeight(topicDoc.data()?.weight);
+      return { skillMap, topicWeight };
+    }),
+  );
+
+  for (const { skillMap, topicWeight } of perTopicSkillRows) {
+    skillMap.forEach((skill, uid) => {
+      const prev = weightedByMember.get(uid) ?? { weightedSum: 0, weightSum: 0 };
+      weightedByMember.set(uid, {
+        weightedSum: prev.weightedSum + skill * topicWeight,
+        weightSum: prev.weightSum + topicWeight,
+      });
+    });
+  }
+
+  const result = new Map<string, number>();
+  weightedByMember.forEach((value, uid) => {
+    if (value.weightSum <= 0) {
+      return;
+    }
+    result.set(uid, value.weightedSum / value.weightSum);
+  });
+
+  return result;
+};
+
 const buildAverageTierMap = (tierPayloads: unknown[], memberSet: Set<string>) => {
   const scoreMap = new Map<string, { sum: number; count: number }>();
 
@@ -346,13 +395,8 @@ const computeOverallWeightedRanking = async (clubId: string, members: ApprovedMe
     buildVoteSkillMap(clubId, memberSet),
   ]);
 
-  const otherPayloadGroups = await Promise.all(
-    topicSnap.docs.map((topicDoc) => getTierListPayloadsByTopic(clubId, topicDoc.id)),
-  );
-  const otherPayloads = otherPayloadGroups.flat();
-
   const overallSkillMap = buildTierSkillMap(overallPayloads, memberSet);
-  const othersSkillMap = buildTierSkillMap(otherPayloads, memberSet);
+  const othersSkillMap = await buildWeightedOtherTopicSkillMap(clubId, memberSet, topicSnap.docs);
 
   const hasOverall = overallSkillMap.size > 0;
   const hasOthers = othersSkillMap.size > 0;
