@@ -32,13 +32,13 @@ type WeightedRank = {
 type CompositeRankWeights = {
   overall: number;
   others: number;
-  vote: number;
+  match: number;
 };
 
 const DEFAULT_COMPOSITE_WEIGHTS: CompositeRankWeights = {
   overall: 0.65,
   others: 0.2,
-  vote: 0.15,
+  match: 0.15,
 };
 
 const CACHE_MS = Number(process.env.COMPUTED_TIER_CACHE_MS ?? 300000);
@@ -310,8 +310,8 @@ const buildAverageTierMap = (tierPayloads: unknown[], memberSet: Set<string>) =>
   return avgMap;
 };
 
-const buildVoteSkillMap = async (clubId: string, memberSet: Set<string>) => {
-  const votesSnap = await getDb().collection("clubs").doc(clubId).collection("votes").get();
+const buildMatchSkillMap = async (clubId: string, memberSet: Set<string>) => {
+  const matchesSnap = await getDb().collection("clubs").doc(clubId).collection("matches").get();
   const statMap = new Map<string, { wins: number; total: number }>();
 
   const ensure = (uid: string) => {
@@ -320,37 +320,35 @@ const buildVoteSkillMap = async (clubId: string, memberSet: Set<string>) => {
     return prev;
   };
 
-  for (const doc of votesSnap.docs) {
+  for (const doc of matchesSnap.docs) {
     const data = doc.data() as {
-      leftId?: unknown;
-      rightId?: unknown;
+      challengerId?: unknown;
+      opponentId?: unknown;
       winnerId?: unknown;
-      A?: unknown;
-      B?: unknown;
-      winner?: unknown;
+      status?: unknown;
     };
 
-    const leftId = typeof data.leftId === "string" ? data.leftId : typeof data.A === "string" ? data.A : "";
-    const rightId = typeof data.rightId === "string" ? data.rightId : typeof data.B === "string" ? data.B : "";
-    const winnerId =
-      typeof data.winnerId === "string" ? data.winnerId : typeof data.winner === "string" ? data.winner : "";
+    const challengerId = typeof data.challengerId === "string" ? data.challengerId : "";
+    const opponentId = typeof data.opponentId === "string" ? data.opponentId : "";
+    const winnerId = typeof data.winnerId === "string" ? data.winnerId : "";
+    const status = typeof data.status === "string" ? data.status : "";
 
-    if (!leftId || !rightId || !winnerId) {
+    if (status !== "resolved" || !challengerId || !opponentId || !winnerId) {
       continue;
     }
-    if (!memberSet.has(leftId) || !memberSet.has(rightId)) {
+    if (!memberSet.has(challengerId) || !memberSet.has(opponentId)) {
       continue;
     }
 
-    const left = ensure(leftId);
-    const right = ensure(rightId);
-    left.total += 1;
-    right.total += 1;
-    if (winnerId === leftId) {
-      left.wins += 1;
+    const challenger = ensure(challengerId);
+    const opponent = ensure(opponentId);
+    challenger.total += 1;
+    opponent.total += 1;
+    if (winnerId === challengerId) {
+      challenger.wins += 1;
     }
-    if (winnerId === rightId) {
-      right.wins += 1;
+    if (winnerId === opponentId) {
+      opponent.wins += 1;
     }
   }
 
@@ -389,10 +387,10 @@ const computeOverallWeightedRanking = async (clubId: string, members: ApprovedMe
   const memberSet = new Set(members.map((member) => member.uid));
   const memberNameMap = new Map(members.map((member) => [member.uid, member.name]));
 
-  const [overallPayloads, topicSnap, voteSkillMap] = await Promise.all([
+  const [overallPayloads, topicSnap, matchSkillMap] = await Promise.all([
     getTierListPayloadsByTopic(clubId, "default"),
     getDb().collection("clubs").doc(clubId).collection("tierTopics").get(),
-    buildVoteSkillMap(clubId, memberSet),
+    buildMatchSkillMap(clubId, memberSet),
   ]);
 
   const overallSkillMap = buildTierSkillMap(overallPayloads, memberSet);
@@ -400,30 +398,30 @@ const computeOverallWeightedRanking = async (clubId: string, members: ApprovedMe
 
   const hasOverall = overallSkillMap.size > 0;
   const hasOthers = othersSkillMap.size > 0;
-  const hasVote = voteSkillMap.size > 0;
+  const hasMatch = matchSkillMap.size > 0;
   const activeWeightSum =
     (hasOverall ? DEFAULT_COMPOSITE_WEIGHTS.overall : 0) +
     (hasOthers ? DEFAULT_COMPOSITE_WEIGHTS.others : 0) +
-    (hasVote ? DEFAULT_COMPOSITE_WEIGHTS.vote : 0);
+    (hasMatch ? DEFAULT_COMPOSITE_WEIGHTS.match : 0);
   const safeWeightSum = activeWeightSum > 0 ? activeWeightSum : 1;
 
   const overallFallback = meanOrNeutral(overallSkillMap);
   const othersFallback = meanOrNeutral(othersSkillMap);
-  const voteFallback = meanOrNeutral(voteSkillMap);
+  const matchFallback = meanOrNeutral(matchSkillMap);
 
   const rows = members.map((member) => {
     const overallScore = overallSkillMap.get(member.uid) ?? overallFallback;
     const othersScore = othersSkillMap.get(member.uid) ?? othersFallback;
-    const voteScore = voteSkillMap.get(member.uid) ?? voteFallback;
+    const matchScore = matchSkillMap.get(member.uid) ?? matchFallback;
 
     const weightedScore =
       ((hasOverall ? DEFAULT_COMPOSITE_WEIGHTS.overall * overallScore : 0) +
         (hasOthers ? DEFAULT_COMPOSITE_WEIGHTS.others * othersScore : 0) +
-        (hasVote ? DEFAULT_COMPOSITE_WEIGHTS.vote * voteScore : 0)) /
+        (hasMatch ? DEFAULT_COMPOSITE_WEIGHTS.match * matchScore : 0)) /
       safeWeightSum;
 
     const hasSignal =
-      overallSkillMap.has(member.uid) || othersSkillMap.has(member.uid) || voteSkillMap.has(member.uid);
+      overallSkillMap.has(member.uid) || othersSkillMap.has(member.uid) || matchSkillMap.has(member.uid);
 
     return {
       userId: member.uid,
@@ -601,41 +599,48 @@ export const getTierExplain = async (clubId: string, userId: string, tierType: T
   const computed = await computeTier(clubId, tierType);
   const peer = computed.scores[userId] ?? 0;
 
-  const pairwiseSnap = await db.collection("clubs").doc(clubId).collection("pairwise").get();
+  const matchesSnap = await db.collection("clubs").doc(clubId).collection("matches").get();
   let wins = 0;
   let totals = 0;
 
-  for (const doc of pairwiseSnap.docs) {
+  for (const doc of matchesSnap.docs) {
     const data = doc.data() as {
-      userLow?: string;
-      userHigh?: string;
-      lowWins?: number;
-      highWins?: number;
-      total?: number;
+      challengerId?: unknown;
+      opponentId?: unknown;
+      winnerId?: unknown;
+      status?: unknown;
     };
 
-    if (data.userLow === userId) {
-      wins += data.lowWins ?? 0;
-      totals += data.total ?? 0;
-    } else if (data.userHigh === userId) {
-      wins += data.highWins ?? 0;
-      totals += data.total ?? 0;
+    const challengerId = typeof data.challengerId === "string" ? data.challengerId : "";
+    const opponentId = typeof data.opponentId === "string" ? data.opponentId : "";
+    const winnerId = typeof data.winnerId === "string" ? data.winnerId : "";
+    const status = typeof data.status === "string" ? data.status : "";
+
+    if (status !== "resolved" || !challengerId || !opponentId || !winnerId) {
+      continue;
+    }
+
+    if (challengerId === userId || opponentId === userId) {
+      totals += 1;
+      if (winnerId === userId) {
+        wins += 1;
+      }
     }
   }
 
-  const vote = totals ? Number(((wins / totals) * 100).toFixed(2)) : peer;
+  const matchResult = totals ? Number(((wins / totals) * 100).toFixed(2)) : peer;
 
   const memberDoc = await db.collection("clubs").doc(clubId).collection("members").doc(userId).get();
   const memberData = memberDoc.data() as { matchScore?: number } | undefined;
   const match = Number(memberData?.matchScore ?? peer);
 
-  const score = Number(average([peer, vote, match]).toFixed(2));
+  const score = Number(average([peer, matchResult, match]).toFixed(2));
 
   return {
     score,
     details: {
       peer: Number(peer.toFixed(2)),
-      vote,
+      matchResult,
       match,
     },
   };

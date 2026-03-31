@@ -8,7 +8,7 @@ const tier_1 = require("../utils/tier");
 const DEFAULT_COMPOSITE_WEIGHTS = {
     overall: 0.65,
     others: 0.2,
-    vote: 0.15,
+    match: 0.15,
 };
 const CACHE_MS = Number(process.env.COMPUTED_TIER_CACHE_MS ?? 300000);
 const LOCK_MS = Number(process.env.COMPUTED_TIER_LOCK_MS ?? 10000);
@@ -164,6 +164,43 @@ const buildTierSkillMap = (tierPayloads, memberSet) => {
     });
     return skillMap;
 };
+const parseTopicWeight = (rawWeight) => {
+    const weight = Number(rawWeight);
+    if (!Number.isFinite(weight) || weight < 0) {
+        return 1;
+    }
+    return weight;
+};
+const buildWeightedOtherTopicSkillMap = async (clubId, memberSet, topicDocs) => {
+    const weightedByMember = new Map();
+    const additionalTopicDocs = topicDocs.filter((topicDoc) => topicDoc.id !== "default");
+    if (!additionalTopicDocs.length) {
+        return new Map();
+    }
+    const perTopicSkillRows = await Promise.all(additionalTopicDocs.map(async (topicDoc) => {
+        const payloads = await getTierListPayloadsByTopic(clubId, topicDoc.id);
+        const skillMap = buildTierSkillMap(payloads, memberSet);
+        const topicWeight = parseTopicWeight(topicDoc.data()?.weight);
+        return { skillMap, topicWeight };
+    }));
+    for (const { skillMap, topicWeight } of perTopicSkillRows) {
+        skillMap.forEach((skill, uid) => {
+            const prev = weightedByMember.get(uid) ?? { weightedSum: 0, weightSum: 0 };
+            weightedByMember.set(uid, {
+                weightedSum: prev.weightedSum + skill * topicWeight,
+                weightSum: prev.weightSum + topicWeight,
+            });
+        });
+    }
+    const result = new Map();
+    weightedByMember.forEach((value, uid) => {
+        if (value.weightSum <= 0) {
+            return;
+        }
+        result.set(uid, value.weightedSum / value.weightSum);
+    });
+    return result;
+};
 const buildAverageTierMap = (tierPayloads, memberSet) => {
     const scoreMap = new Map();
     for (const payload of tierPayloads) {
@@ -182,34 +219,35 @@ const buildAverageTierMap = (tierPayloads, memberSet) => {
     });
     return avgMap;
 };
-const buildVoteSkillMap = async (clubId, memberSet) => {
-    const votesSnap = await (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("votes").get();
+const buildMatchSkillMap = async (clubId, memberSet) => {
+    const matchesSnap = await (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("matches").get();
     const statMap = new Map();
     const ensure = (uid) => {
         const prev = statMap.get(uid) ?? { wins: 0, total: 0 };
         statMap.set(uid, prev);
         return prev;
     };
-    for (const doc of votesSnap.docs) {
+    for (const doc of matchesSnap.docs) {
         const data = doc.data();
-        const leftId = typeof data.leftId === "string" ? data.leftId : typeof data.A === "string" ? data.A : "";
-        const rightId = typeof data.rightId === "string" ? data.rightId : typeof data.B === "string" ? data.B : "";
-        const winnerId = typeof data.winnerId === "string" ? data.winnerId : typeof data.winner === "string" ? data.winner : "";
-        if (!leftId || !rightId || !winnerId) {
+        const challengerId = typeof data.challengerId === "string" ? data.challengerId : "";
+        const opponentId = typeof data.opponentId === "string" ? data.opponentId : "";
+        const winnerId = typeof data.winnerId === "string" ? data.winnerId : "";
+        const status = typeof data.status === "string" ? data.status : "";
+        if (status !== "resolved" || !challengerId || !opponentId || !winnerId) {
             continue;
         }
-        if (!memberSet.has(leftId) || !memberSet.has(rightId)) {
+        if (!memberSet.has(challengerId) || !memberSet.has(opponentId)) {
             continue;
         }
-        const left = ensure(leftId);
-        const right = ensure(rightId);
-        left.total += 1;
-        right.total += 1;
-        if (winnerId === leftId) {
-            left.wins += 1;
+        const challenger = ensure(challengerId);
+        const opponent = ensure(opponentId);
+        challenger.total += 1;
+        opponent.total += 1;
+        if (winnerId === challengerId) {
+            challenger.wins += 1;
         }
-        if (winnerId === rightId) {
-            right.wins += 1;
+        if (winnerId === opponentId) {
+            opponent.wins += 1;
         }
     }
     const skillMap = new Map();
@@ -239,34 +277,32 @@ const sortByScoreWithNameTieBreak = (rows, memberNameMap) => [...rows].sort((a, 
 const computeOverallWeightedRanking = async (clubId, members) => {
     const memberSet = new Set(members.map((member) => member.uid));
     const memberNameMap = new Map(members.map((member) => [member.uid, member.name]));
-    const [overallPayloads, topicSnap, voteSkillMap] = await Promise.all([
+    const [overallPayloads, topicSnap, matchSkillMap] = await Promise.all([
         getTierListPayloadsByTopic(clubId, "default"),
         (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("tierTopics").get(),
-        buildVoteSkillMap(clubId, memberSet),
+        buildMatchSkillMap(clubId, memberSet),
     ]);
-    const otherPayloadGroups = await Promise.all(topicSnap.docs.map((topicDoc) => getTierListPayloadsByTopic(clubId, topicDoc.id)));
-    const otherPayloads = otherPayloadGroups.flat();
     const overallSkillMap = buildTierSkillMap(overallPayloads, memberSet);
-    const othersSkillMap = buildTierSkillMap(otherPayloads, memberSet);
+    const othersSkillMap = await buildWeightedOtherTopicSkillMap(clubId, memberSet, topicSnap.docs);
     const hasOverall = overallSkillMap.size > 0;
     const hasOthers = othersSkillMap.size > 0;
-    const hasVote = voteSkillMap.size > 0;
+    const hasMatch = matchSkillMap.size > 0;
     const activeWeightSum = (hasOverall ? DEFAULT_COMPOSITE_WEIGHTS.overall : 0) +
         (hasOthers ? DEFAULT_COMPOSITE_WEIGHTS.others : 0) +
-        (hasVote ? DEFAULT_COMPOSITE_WEIGHTS.vote : 0);
+        (hasMatch ? DEFAULT_COMPOSITE_WEIGHTS.match : 0);
     const safeWeightSum = activeWeightSum > 0 ? activeWeightSum : 1;
     const overallFallback = meanOrNeutral(overallSkillMap);
     const othersFallback = meanOrNeutral(othersSkillMap);
-    const voteFallback = meanOrNeutral(voteSkillMap);
+    const matchFallback = meanOrNeutral(matchSkillMap);
     const rows = members.map((member) => {
         const overallScore = overallSkillMap.get(member.uid) ?? overallFallback;
         const othersScore = othersSkillMap.get(member.uid) ?? othersFallback;
-        const voteScore = voteSkillMap.get(member.uid) ?? voteFallback;
+        const matchScore = matchSkillMap.get(member.uid) ?? matchFallback;
         const weightedScore = ((hasOverall ? DEFAULT_COMPOSITE_WEIGHTS.overall * overallScore : 0) +
             (hasOthers ? DEFAULT_COMPOSITE_WEIGHTS.others * othersScore : 0) +
-            (hasVote ? DEFAULT_COMPOSITE_WEIGHTS.vote * voteScore : 0)) /
+            (hasMatch ? DEFAULT_COMPOSITE_WEIGHTS.match * matchScore : 0)) /
             safeWeightSum;
-        const hasSignal = overallSkillMap.has(member.uid) || othersSkillMap.has(member.uid) || voteSkillMap.has(member.uid);
+        const hasSignal = overallSkillMap.has(member.uid) || othersSkillMap.has(member.uid) || matchSkillMap.has(member.uid);
         return {
             userId: member.uid,
             score: weightedScore,
@@ -405,30 +441,35 @@ const getTierExplain = async (clubId, userId, tierType) => {
     const db = (0, admin_1.getDb)();
     const computed = await (0, exports.computeTier)(clubId, tierType);
     const peer = computed.scores[userId] ?? 0;
-    const pairwiseSnap = await db.collection("clubs").doc(clubId).collection("pairwise").get();
+    const matchesSnap = await db.collection("clubs").doc(clubId).collection("matches").get();
     let wins = 0;
     let totals = 0;
-    for (const doc of pairwiseSnap.docs) {
+    for (const doc of matchesSnap.docs) {
         const data = doc.data();
-        if (data.userLow === userId) {
-            wins += data.lowWins ?? 0;
-            totals += data.total ?? 0;
+        const challengerId = typeof data.challengerId === "string" ? data.challengerId : "";
+        const opponentId = typeof data.opponentId === "string" ? data.opponentId : "";
+        const winnerId = typeof data.winnerId === "string" ? data.winnerId : "";
+        const status = typeof data.status === "string" ? data.status : "";
+        if (status !== "resolved" || !challengerId || !opponentId || !winnerId) {
+            continue;
         }
-        else if (data.userHigh === userId) {
-            wins += data.highWins ?? 0;
-            totals += data.total ?? 0;
+        if (challengerId === userId || opponentId === userId) {
+            totals += 1;
+            if (winnerId === userId) {
+                wins += 1;
+            }
         }
     }
-    const vote = totals ? Number(((wins / totals) * 100).toFixed(2)) : peer;
+    const matchResult = totals ? Number(((wins / totals) * 100).toFixed(2)) : peer;
     const memberDoc = await db.collection("clubs").doc(clubId).collection("members").doc(userId).get();
     const memberData = memberDoc.data();
     const match = Number(memberData?.matchScore ?? peer);
-    const score = Number((0, tier_1.average)([peer, vote, match]).toFixed(2));
+    const score = Number((0, tier_1.average)([peer, matchResult, match]).toFixed(2));
     return {
         score,
         details: {
             peer: Number(peer.toFixed(2)),
-            vote,
+            matchResult,
             match,
         },
     };

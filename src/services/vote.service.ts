@@ -1,52 +1,57 @@
 import { FieldValue } from "firebase-admin/firestore";
 import { getDb } from "../firebase/admin";
 
-const buildPairKey = (a: string, b: string) => {
-  const [low, high] = [a, b].sort();
-  return { key: `${low}__${high}`, low, high };
+export const createMatch = async (clubId: string, challengerId: string, opponentId: string) => {
+  const db = getDb();
+  const matchesRef = db.collection("clubs").doc(clubId).collection("matches");
+
+  await matchesRef.add({
+    challengerId,
+    opponentId,
+    createdBy: challengerId,
+    status: "pending",
+    createdAt: FieldValue.serverTimestamp(),
+  });
 };
 
-export const submitVote = async (clubId: string, voterId: string, A: string, B: string, selected: "A" | "B") => {
+export const resolveMatch = async (clubId: string, matchId: string, winnerId: string, resolvedBy: string) => {
   const db = getDb();
-  const votesRef = db.collection("clubs").doc(clubId).collection("votes");
-  const pairwiseRef = db.collection("clubs").doc(clubId).collection("pairwise");
-
-  const winner = selected === "A" ? A : B;
-  const loser = selected === "A" ? B : A;
-  const pair = buildPairKey(A, B);
+  const matchRef = db.collection("clubs").doc(clubId).collection("matches").doc(matchId);
 
   await db.runTransaction(async (tx) => {
-    const voteDoc = votesRef.doc();
-    tx.set(voteDoc, {
-      voterId,
-      A,
-      B,
-      selected,
-      winner,
-      loser,
-      createdAt: FieldValue.serverTimestamp(),
+    const snap = await tx.get(matchRef);
+    if (!snap.exists) {
+      throw new Error("MATCH_NOT_FOUND");
+    }
+
+    const data = snap.data() as {
+      challengerId?: unknown;
+      opponentId?: unknown;
+      status?: unknown;
+    };
+
+    const challengerId = typeof data.challengerId === "string" ? data.challengerId : "";
+    const opponentId = typeof data.opponentId === "string" ? data.opponentId : "";
+    const status = typeof data.status === "string" ? data.status : "";
+
+    if (!challengerId || !opponentId) {
+      throw new Error("INVALID_MATCH");
+    }
+
+    if (winnerId !== challengerId && winnerId !== opponentId) {
+      throw new Error("WINNER_NOT_IN_MATCH");
+    }
+
+    if (status === "resolved") {
+      return;
+    }
+
+    tx.update(matchRef, {
+      status: "resolved",
+      winnerId,
+      resolvedBy,
+      resolvedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     });
-
-    const pairDoc = pairwiseRef.doc(pair.key);
-    const pairSnap = await tx.get(pairDoc);
-    const row = (pairSnap.data() as {
-      lowWins?: number;
-      highWins?: number;
-      total?: number;
-    }) ?? { lowWins: 0, highWins: 0, total: 0 };
-
-    const winnerIsLow = winner === pair.low;
-    tx.set(
-      pairDoc,
-      {
-        userLow: pair.low,
-        userHigh: pair.high,
-        lowWins: (row.lowWins ?? 0) + (winnerIsLow ? 1 : 0),
-        highWins: (row.highWins ?? 0) + (winnerIsLow ? 0 : 1),
-        total: (row.total ?? 0) + 1,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
   });
 };
