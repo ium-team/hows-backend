@@ -1,7 +1,7 @@
 import { Timestamp } from "firebase-admin/firestore";
 import { getDb } from "../firebase/admin";
 import { ensureClubExists } from "../utils/firestore";
-import { average, scoreToTier } from "../utils/tier";
+import { scoreToTier } from "../utils/tier";
 
 export type TierType = "overall" | "dribble" | "shoot";
 
@@ -34,17 +34,18 @@ type WeightedRank = {
   hasSignal: boolean;
 };
 
-type CompositeRankWeights = {
-  overall: number;
-  others: number;
-  match: number;
+type MatchDuelStat = {
+  wins: number;
+  losses: number;
+  total: number;
 };
 
-const DEFAULT_COMPOSITE_WEIGHTS: CompositeRankWeights = {
-  overall: 0.65,
-  others: 0.2,
-  match: 0.15,
-};
+const OVERALL_BASE_WEIGHT = 0.8;
+const OVERALL_OTHERS_WEIGHT = 0.2;
+const MATCH_ELO_K = 0.06; // 6 points in 100-point score scale
+const MATCH_EXPECTED_SCALE = 0.12;
+const RATING_MIN = 0;
+const RATING_MAX = 1;
 
 const CACHE_MS = Number(process.env.COMPUTED_TIER_CACHE_MS ?? 300000);
 const LOCK_MS = Number(process.env.COMPUTED_TIER_LOCK_MS ?? 10000);
@@ -327,17 +328,46 @@ const buildAverageTierMap = (tierPayloads: TierListPayload[], memberSet: Set<str
   return avgMap;
 };
 
-const buildMatchSkillMap = async (clubId: string, memberSet: Set<string>) => {
+const buildDuelAdjustedScoreMap = async (
+  clubId: string,
+  memberSet: Set<string>,
+  baseScoreMap: Map<string, number>,
+) => {
   const matchesSnap = await getDb().collection("clubs").doc(clubId).collection("matches").get();
-  const statMap = new Map<string, { wins: number; total: number }>();
+  const ratingMap = new Map<string, number>(baseScoreMap);
+  const matchStatMap = new Map<string, MatchDuelStat>();
 
-  const ensure = (uid: string) => {
-    const prev = statMap.get(uid) ?? { wins: 0, total: 0 };
-    statMap.set(uid, prev);
+  const expectedScore = (self: number, opponent: number) =>
+    1 / (1 + Math.exp((opponent - self) / MATCH_EXPECTED_SCALE));
+
+  const ensureMatchStat = (uid: string) => {
+    const prev = matchStatMap.get(uid) ?? { wins: 0, losses: 0, total: 0 };
+    matchStatMap.set(uid, prev);
     return prev;
   };
 
-  for (const doc of matchesSnap.docs) {
+  const matchDocs = [...matchesSnap.docs].sort((a, b) => {
+    const dataA = a.data() as { resolvedAt?: Timestamp; createdAt?: Timestamp };
+    const dataB = b.data() as { resolvedAt?: Timestamp; createdAt?: Timestamp };
+    const timeA =
+      dataA.resolvedAt instanceof Timestamp
+        ? dataA.resolvedAt.toMillis()
+        : dataA.createdAt instanceof Timestamp
+          ? dataA.createdAt.toMillis()
+          : 0;
+    const timeB =
+      dataB.resolvedAt instanceof Timestamp
+        ? dataB.resolvedAt.toMillis()
+        : dataB.createdAt instanceof Timestamp
+          ? dataB.createdAt.toMillis()
+          : 0;
+    if (timeA !== timeB) {
+      return timeA - timeB;
+    }
+    return a.id.localeCompare(b.id);
+  });
+
+  for (const doc of matchDocs) {
     const data = doc.data() as {
       challengerId?: unknown;
       opponentId?: unknown;
@@ -357,36 +387,75 @@ const buildMatchSkillMap = async (clubId: string, memberSet: Set<string>) => {
       continue;
     }
 
-    const challenger = ensure(challengerId);
-    const opponent = ensure(opponentId);
-    challenger.total += 1;
-    opponent.total += 1;
-    if (winnerId === challengerId) {
-      challenger.wins += 1;
+    const challengerBase = ratingMap.get(challengerId);
+    const opponentBase = ratingMap.get(opponentId);
+    if (challengerBase === undefined || opponentBase === undefined) {
+      continue;
     }
-    if (winnerId === opponentId) {
-      opponent.wins += 1;
+
+    const challengerActual = winnerId === challengerId ? 1 : winnerId === opponentId ? 0 : null;
+    if (challengerActual === null) {
+      continue;
+    }
+    const opponentActual = 1 - challengerActual;
+
+    const challengerExpected = expectedScore(challengerBase, opponentBase);
+    const opponentExpected = expectedScore(opponentBase, challengerBase);
+
+    const challengerNext = Math.max(
+      RATING_MIN,
+      Math.min(RATING_MAX, challengerBase + MATCH_ELO_K * (challengerActual - challengerExpected)),
+    );
+    const opponentNext = Math.max(
+      RATING_MIN,
+      Math.min(RATING_MAX, opponentBase + MATCH_ELO_K * (opponentActual - opponentExpected)),
+    );
+
+    ratingMap.set(challengerId, challengerNext);
+    ratingMap.set(opponentId, opponentNext);
+
+    const challengerStat = ensureMatchStat(challengerId);
+    const opponentStat = ensureMatchStat(opponentId);
+    challengerStat.total += 1;
+    opponentStat.total += 1;
+    if (challengerActual === 1) {
+      challengerStat.wins += 1;
+      opponentStat.losses += 1;
+    } else {
+      challengerStat.losses += 1;
+      opponentStat.wins += 1;
     }
   }
 
-  const skillMap = new Map<string, number>();
-  statMap.forEach((value, uid) => {
-    skillMap.set(uid, (value.wins + 1) / (value.total + 2));
-  });
-
-  return skillMap;
+  return { ratingMap, matchStatMap };
 };
 
-const meanOrNeutral = (skillMap: Map<string, number>) => {
-  if (!skillMap.size) {
-    return 0.5;
+const buildOverallScoreMaps = async (clubId: string, members: ApprovedMember[]) => {
+  const memberSet = new Set(members.map((member) => member.uid));
+  const [overallPayloads, topicSnap] = await Promise.all([
+    getTierListPayloadsByTopic(clubId, "default"),
+    getDb().collection("clubs").doc(clubId).collection("tierTopics").get(),
+  ]);
+
+  const overallSkillMap = buildTierSkillMap(overallPayloads, memberSet);
+  const othersSkillMap = await buildWeightedOtherTopicSkillMap(clubId, memberSet, topicSnap.docs);
+  const baseScoreMap = new Map<string, number>();
+
+  for (const member of members) {
+    const defaultScore = overallSkillMap.get(member.uid);
+    if (defaultScore === undefined) {
+      continue;
+    }
+    const othersScore = othersSkillMap.get(member.uid);
+    const baseScore =
+      othersScore === undefined
+        ? defaultScore
+        : defaultScore * OVERALL_BASE_WEIGHT + othersScore * OVERALL_OTHERS_WEIGHT;
+    baseScoreMap.set(member.uid, baseScore);
   }
 
-  let sum = 0;
-  skillMap.forEach((value) => {
-    sum += value;
-  });
-  return sum / skillMap.size;
+  const { ratingMap, matchStatMap } = await buildDuelAdjustedScoreMap(clubId, memberSet, baseScoreMap);
+  return { overallSkillMap, othersSkillMap, baseScoreMap, ratingMap, matchStatMap };
 };
 
 const sortByScoreWithNameTieBreak = (rows: WeightedRank[], memberNameMap: Map<string, string>) =>
@@ -401,49 +470,25 @@ const sortByScoreWithNameTieBreak = (rows: WeightedRank[], memberNameMap: Map<st
   });
 
 const computeOverallWeightedRanking = async (clubId: string, members: ApprovedMember[]): Promise<WeightedRank[]> => {
-  const memberSet = new Set(members.map((member) => member.uid));
   const memberNameMap = new Map(members.map((member) => [member.uid, member.name]));
-
-  const [overallPayloads, topicSnap, matchSkillMap] = await Promise.all([
-    getTierListPayloadsByTopic(clubId, "default"),
-    getDb().collection("clubs").doc(clubId).collection("tierTopics").get(),
-    buildMatchSkillMap(clubId, memberSet),
-  ]);
-
-  const overallSkillMap = buildTierSkillMap(overallPayloads, memberSet);
-  const othersSkillMap = await buildWeightedOtherTopicSkillMap(clubId, memberSet, topicSnap.docs);
-
-  const hasOverall = overallSkillMap.size > 0;
-  const hasOthers = othersSkillMap.size > 0;
-  const hasMatch = matchSkillMap.size > 0;
-  const activeWeightSum =
-    (hasOverall ? DEFAULT_COMPOSITE_WEIGHTS.overall : 0) +
-    (hasOthers ? DEFAULT_COMPOSITE_WEIGHTS.others : 0) +
-    (hasMatch ? DEFAULT_COMPOSITE_WEIGHTS.match : 0);
-  const safeWeightSum = activeWeightSum > 0 ? activeWeightSum : 1;
-
-  const overallFallback = meanOrNeutral(overallSkillMap);
-  const othersFallback = meanOrNeutral(othersSkillMap);
-  const matchFallback = meanOrNeutral(matchSkillMap);
+  const { baseScoreMap, ratingMap } = await buildOverallScoreMaps(clubId, members);
 
   const rows = members.map((member) => {
-    const overallScore = overallSkillMap.get(member.uid) ?? overallFallback;
-    const othersScore = othersSkillMap.get(member.uid) ?? othersFallback;
-    const matchScore = matchSkillMap.get(member.uid) ?? matchFallback;
+    const baseScore = baseScoreMap.get(member.uid);
+    if (baseScore === undefined) {
+      return {
+        userId: member.uid,
+        score: 0,
+        hasSignal: false,
+      };
+    }
 
-    const weightedScore =
-      ((hasOverall ? DEFAULT_COMPOSITE_WEIGHTS.overall * overallScore : 0) +
-        (hasOthers ? DEFAULT_COMPOSITE_WEIGHTS.others * othersScore : 0) +
-        (hasMatch ? DEFAULT_COMPOSITE_WEIGHTS.match * matchScore : 0)) /
-      safeWeightSum;
-
-    const hasSignal =
-      overallSkillMap.has(member.uid) || othersSkillMap.has(member.uid) || matchSkillMap.has(member.uid);
+    const weightedScore = ratingMap.get(member.uid) ?? baseScore;
 
     return {
       userId: member.uid,
       score: weightedScore,
-      hasSignal,
+      hasSignal: true,
     };
   });
 
@@ -670,53 +715,53 @@ export const resetClubTierData = async (clubId: string, options?: { includeMatch
 };
 
 export const getTierExplain = async (clubId: string, userId: string, tierType: TierType) => {
-  const db = getDb();
-  const computed = await computeTier(clubId, tierType);
-  const peer = computed.scores[userId] ?? 0;
-
-  const matchesSnap = await db.collection("clubs").doc(clubId).collection("matches").get();
-  let wins = 0;
-  let totals = 0;
-
-  for (const doc of matchesSnap.docs) {
-    const data = doc.data() as {
-      challengerId?: unknown;
-      opponentId?: unknown;
-      winnerId?: unknown;
-      status?: unknown;
+  if (tierType !== "overall") {
+    const computed = await computeTier(clubId, tierType);
+    const score = Number((computed.scores[userId] ?? 0).toFixed(2));
+    return {
+      score,
+      details: {
+        tierType,
+        method: "topic_average",
+      },
     };
-
-    const challengerId = typeof data.challengerId === "string" ? data.challengerId : "";
-    const opponentId = typeof data.opponentId === "string" ? data.opponentId : "";
-    const winnerId = typeof data.winnerId === "string" ? data.winnerId : "";
-    const status = typeof data.status === "string" ? data.status : "";
-
-    if (status !== "resolved" || !challengerId || !opponentId || !winnerId) {
-      continue;
-    }
-
-    if (challengerId === userId || opponentId === userId) {
-      totals += 1;
-      if (winnerId === userId) {
-        wins += 1;
-      }
-    }
   }
 
-  const matchResult = totals ? Number(((wins / totals) * 100).toFixed(2)) : peer;
+  const members = await getApprovedMembers(clubId);
+  const { overallSkillMap, othersSkillMap, baseScoreMap, ratingMap, matchStatMap } = await buildOverallScoreMaps(
+    clubId,
+    members,
+  );
 
-  const memberDoc = await db.collection("clubs").doc(clubId).collection("members").doc(userId).get();
-  const memberData = memberDoc.data() as { matchScore?: number } | undefined;
-  const match = Number(memberData?.matchScore ?? peer);
+  const defaultScoreRaw = overallSkillMap.get(userId);
+  if (defaultScoreRaw === undefined) {
+    return {
+      score: 0,
+      details: {
+        tierType: "overall",
+        hasSignal: false,
+      },
+    };
+  }
 
-  const score = Number(average([peer, matchResult, match]).toFixed(2));
+  const othersScoreRaw = othersSkillMap.get(userId);
+  const baseScoreRaw = baseScoreMap.get(userId) ?? defaultScoreRaw;
+  const duelAdjustedRaw = ratingMap.get(userId) ?? baseScoreRaw;
+  const duelDeltaRaw = duelAdjustedRaw - baseScoreRaw;
+  const matchStat = matchStatMap.get(userId) ?? { wins: 0, losses: 0, total: 0 };
 
   return {
-    score,
+    score: Number((duelAdjustedRaw * 100).toFixed(2)),
     details: {
-      peer: Number(peer.toFixed(2)),
-      matchResult,
-      match,
+      tierType: "overall",
+      hasSignal: true,
+      defaultScore: Number((defaultScoreRaw * 100).toFixed(2)),
+      othersScore: othersScoreRaw === undefined ? null : Number((othersScoreRaw * 100).toFixed(2)),
+      baseScore: Number((baseScoreRaw * 100).toFixed(2)),
+      duelAdjustedScore: Number((duelAdjustedRaw * 100).toFixed(2)),
+      duelDelta: Number((duelDeltaRaw * 100).toFixed(2)),
+      duelK: Number((MATCH_ELO_K * 100).toFixed(2)),
+      matches: matchStat,
     },
   };
 };

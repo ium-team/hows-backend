@@ -22,6 +22,10 @@ const recomputeSchema = zod_1.z.object({
     clubId: zod_1.z.string().min(1),
     topicId: zod_1.z.string().min(1).optional(),
 });
+const resetSchema = zod_1.z.object({
+    clubId: zod_1.z.string().min(1),
+    includeMatches: zod_1.z.boolean().optional(),
+});
 const registerTierRoutes = async (fastify) => {
     fastify.post("/compute", async (request) => {
         const body = computeSchema.parse(request.body);
@@ -43,6 +47,11 @@ const registerTierRoutes = async (fastify) => {
         const body = recomputeSchema.parse(request.body);
         await (0, firestore_1.ensureOwner)((0, admin_1.getDb)(), body.clubId, request.userId);
         return (0, tier_service_1.recomputeClubTierSnapshots)(body.clubId, body.topicId);
+    });
+    fastify.post("/reset", async (request) => {
+        const body = resetSchema.parse(request.body);
+        await (0, firestore_1.ensureOwner)((0, admin_1.getDb)(), body.clubId, request.userId);
+        return (0, tier_service_1.resetClubTierData)(body.clubId, { includeMatches: body.includeMatches });
     });
 };
 exports.registerTierRoutes = registerTierRoutes;

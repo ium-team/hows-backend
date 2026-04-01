@@ -1,18 +1,22 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getTierExplain = exports.recomputeClubTierSnapshots = exports.computeAndStoreTierBoard = exports.computeTierBoard = exports.computeTier = void 0;
+exports.getTierExplain = exports.resetClubTierData = exports.recomputeClubTierSnapshots = exports.computeAndStoreTierBoard = exports.computeTierBoard = exports.computeTier = void 0;
 const firestore_1 = require("firebase-admin/firestore");
 const admin_1 = require("../firebase/admin");
 const firestore_2 = require("../utils/firestore");
 const tier_1 = require("../utils/tier");
-const DEFAULT_COMPOSITE_WEIGHTS = {
-    overall: 0.65,
-    others: 0.2,
-    match: 0.15,
-};
+const OVERALL_BASE_WEIGHT = 0.8;
+const OVERALL_OTHERS_WEIGHT = 0.2;
+const MATCH_ELO_K = 0.06; // 6 points in 100-point score scale
+const MATCH_EXPECTED_SCALE = 0.12;
+const RATING_MIN = 0;
+const RATING_MAX = 1;
 const CACHE_MS = Number(process.env.COMPUTED_TIER_CACHE_MS ?? 300000);
 const LOCK_MS = Number(process.env.COMPUTED_TIER_LOCK_MS ?? 10000);
-const parseTierListDoc = (payload) => {
+const MIN_TIER = 0;
+const MAX_TIER = 9;
+const isValidTierNumber = (value) => Number.isInteger(value) && value >= MIN_TIER && value <= MAX_TIER;
+const parseTierListDoc = ({ evaluatorId, data: payload }) => {
     const rows = [];
     if (!payload || typeof payload !== "object") {
         return rows;
@@ -24,7 +28,7 @@ const parseTierListDoc = (payload) => {
         }
         for (const [tierKey, rawUsers] of Object.entries(record)) {
             const tierNumber = Number(tierKey);
-            if (!Number.isFinite(tierNumber)) {
+            if (!isValidTierNumber(tierNumber)) {
                 continue;
             }
             if (!Array.isArray(rawUsers)) {
@@ -32,6 +36,9 @@ const parseTierListDoc = (payload) => {
             }
             for (const rawUser of rawUsers) {
                 if (typeof rawUser !== "string" || !rawUser) {
+                    continue;
+                }
+                if (evaluatorId && rawUser === evaluatorId) {
                     continue;
                 }
                 rows.push({ userId: rawUser, tier: tierNumber });
@@ -44,7 +51,10 @@ const parseTierListDoc = (payload) => {
         for (const row of data.rankings) {
             const userId = typeof row.userId === "string" ? row.userId : "";
             const tier = Number(row.tier);
-            if (!userId || !Number.isFinite(tier)) {
+            if (!userId || !isValidTierNumber(tier)) {
+                continue;
+            }
+            if (evaluatorId && userId === evaluatorId) {
                 continue;
             }
             rows.push({ userId, tier });
@@ -129,7 +139,7 @@ const getTierListPayloadsByTopic = async (clubId, topicId) => {
     const db = (0, admin_1.getDb)();
     if (topicId !== "default") {
         const snap = await db.collection("clubs").doc(clubId).collection("tierTopics").doc(topicId).collection("tierLists").get();
-        return snap.docs.map((doc) => doc.data());
+        return snap.docs.map((doc) => ({ evaluatorId: doc.id, data: doc.data() }));
     }
     const defaultTopicSnap = await db
         .collection("clubs")
@@ -139,10 +149,10 @@ const getTierListPayloadsByTopic = async (clubId, topicId) => {
         .collection("tierLists")
         .get();
     if (!defaultTopicSnap.empty) {
-        return defaultTopicSnap.docs.map((doc) => doc.data());
+        return defaultTopicSnap.docs.map((doc) => ({ evaluatorId: doc.id, data: doc.data() }));
     }
     const rootSnap = await db.collection("clubs").doc(clubId).collection("tierLists").get();
-    return rootSnap.docs.map((doc) => doc.data());
+    return rootSnap.docs.map((doc) => ({ evaluatorId: doc.id, data: doc.data() }));
 };
 const buildTierSkillMap = (tierPayloads, memberSet) => {
     const scoreMap = new Map();
@@ -219,15 +229,35 @@ const buildAverageTierMap = (tierPayloads, memberSet) => {
     });
     return avgMap;
 };
-const buildMatchSkillMap = async (clubId, memberSet) => {
+const buildDuelAdjustedScoreMap = async (clubId, memberSet, baseScoreMap) => {
     const matchesSnap = await (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("matches").get();
-    const statMap = new Map();
-    const ensure = (uid) => {
-        const prev = statMap.get(uid) ?? { wins: 0, total: 0 };
-        statMap.set(uid, prev);
+    const ratingMap = new Map(baseScoreMap);
+    const matchStatMap = new Map();
+    const expectedScore = (self, opponent) => 1 / (1 + Math.exp((opponent - self) / MATCH_EXPECTED_SCALE));
+    const ensureMatchStat = (uid) => {
+        const prev = matchStatMap.get(uid) ?? { wins: 0, losses: 0, total: 0 };
+        matchStatMap.set(uid, prev);
         return prev;
     };
-    for (const doc of matchesSnap.docs) {
+    const matchDocs = [...matchesSnap.docs].sort((a, b) => {
+        const dataA = a.data();
+        const dataB = b.data();
+        const timeA = dataA.resolvedAt instanceof firestore_1.Timestamp
+            ? dataA.resolvedAt.toMillis()
+            : dataA.createdAt instanceof firestore_1.Timestamp
+                ? dataA.createdAt.toMillis()
+                : 0;
+        const timeB = dataB.resolvedAt instanceof firestore_1.Timestamp
+            ? dataB.resolvedAt.toMillis()
+            : dataB.createdAt instanceof firestore_1.Timestamp
+                ? dataB.createdAt.toMillis()
+                : 0;
+        if (timeA !== timeB) {
+            return timeA - timeB;
+        }
+        return a.id.localeCompare(b.id);
+    });
+    for (const doc of matchDocs) {
         const data = doc.data();
         const challengerId = typeof data.challengerId === "string" ? data.challengerId : "";
         const opponentId = typeof data.opponentId === "string" ? data.opponentId : "";
@@ -239,32 +269,59 @@ const buildMatchSkillMap = async (clubId, memberSet) => {
         if (!memberSet.has(challengerId) || !memberSet.has(opponentId)) {
             continue;
         }
-        const challenger = ensure(challengerId);
-        const opponent = ensure(opponentId);
-        challenger.total += 1;
-        opponent.total += 1;
-        if (winnerId === challengerId) {
-            challenger.wins += 1;
+        const challengerBase = ratingMap.get(challengerId);
+        const opponentBase = ratingMap.get(opponentId);
+        if (challengerBase === undefined || opponentBase === undefined) {
+            continue;
         }
-        if (winnerId === opponentId) {
-            opponent.wins += 1;
+        const challengerActual = winnerId === challengerId ? 1 : winnerId === opponentId ? 0 : null;
+        if (challengerActual === null) {
+            continue;
+        }
+        const opponentActual = 1 - challengerActual;
+        const challengerExpected = expectedScore(challengerBase, opponentBase);
+        const opponentExpected = expectedScore(opponentBase, challengerBase);
+        const challengerNext = Math.max(RATING_MIN, Math.min(RATING_MAX, challengerBase + MATCH_ELO_K * (challengerActual - challengerExpected)));
+        const opponentNext = Math.max(RATING_MIN, Math.min(RATING_MAX, opponentBase + MATCH_ELO_K * (opponentActual - opponentExpected)));
+        ratingMap.set(challengerId, challengerNext);
+        ratingMap.set(opponentId, opponentNext);
+        const challengerStat = ensureMatchStat(challengerId);
+        const opponentStat = ensureMatchStat(opponentId);
+        challengerStat.total += 1;
+        opponentStat.total += 1;
+        if (challengerActual === 1) {
+            challengerStat.wins += 1;
+            opponentStat.losses += 1;
+        }
+        else {
+            challengerStat.losses += 1;
+            opponentStat.wins += 1;
         }
     }
-    const skillMap = new Map();
-    statMap.forEach((value, uid) => {
-        skillMap.set(uid, (value.wins + 1) / (value.total + 2));
-    });
-    return skillMap;
+    return { ratingMap, matchStatMap };
 };
-const meanOrNeutral = (skillMap) => {
-    if (!skillMap.size) {
-        return 0.5;
+const buildOverallScoreMaps = async (clubId, members) => {
+    const memberSet = new Set(members.map((member) => member.uid));
+    const [overallPayloads, topicSnap] = await Promise.all([
+        getTierListPayloadsByTopic(clubId, "default"),
+        (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("tierTopics").get(),
+    ]);
+    const overallSkillMap = buildTierSkillMap(overallPayloads, memberSet);
+    const othersSkillMap = await buildWeightedOtherTopicSkillMap(clubId, memberSet, topicSnap.docs);
+    const baseScoreMap = new Map();
+    for (const member of members) {
+        const defaultScore = overallSkillMap.get(member.uid);
+        if (defaultScore === undefined) {
+            continue;
+        }
+        const othersScore = othersSkillMap.get(member.uid);
+        const baseScore = othersScore === undefined
+            ? defaultScore
+            : defaultScore * OVERALL_BASE_WEIGHT + othersScore * OVERALL_OTHERS_WEIGHT;
+        baseScoreMap.set(member.uid, baseScore);
     }
-    let sum = 0;
-    skillMap.forEach((value) => {
-        sum += value;
-    });
-    return sum / skillMap.size;
+    const { ratingMap, matchStatMap } = await buildDuelAdjustedScoreMap(clubId, memberSet, baseScoreMap);
+    return { overallSkillMap, othersSkillMap, baseScoreMap, ratingMap, matchStatMap };
 };
 const sortByScoreWithNameTieBreak = (rows, memberNameMap) => [...rows].sort((a, b) => {
     if (b.score !== a.score) {
@@ -275,38 +332,22 @@ const sortByScoreWithNameTieBreak = (rows, memberNameMap) => [...rows].sort((a, 
     return nameA.localeCompare(nameB, "ko");
 });
 const computeOverallWeightedRanking = async (clubId, members) => {
-    const memberSet = new Set(members.map((member) => member.uid));
     const memberNameMap = new Map(members.map((member) => [member.uid, member.name]));
-    const [overallPayloads, topicSnap, matchSkillMap] = await Promise.all([
-        getTierListPayloadsByTopic(clubId, "default"),
-        (0, admin_1.getDb)().collection("clubs").doc(clubId).collection("tierTopics").get(),
-        buildMatchSkillMap(clubId, memberSet),
-    ]);
-    const overallSkillMap = buildTierSkillMap(overallPayloads, memberSet);
-    const othersSkillMap = await buildWeightedOtherTopicSkillMap(clubId, memberSet, topicSnap.docs);
-    const hasOverall = overallSkillMap.size > 0;
-    const hasOthers = othersSkillMap.size > 0;
-    const hasMatch = matchSkillMap.size > 0;
-    const activeWeightSum = (hasOverall ? DEFAULT_COMPOSITE_WEIGHTS.overall : 0) +
-        (hasOthers ? DEFAULT_COMPOSITE_WEIGHTS.others : 0) +
-        (hasMatch ? DEFAULT_COMPOSITE_WEIGHTS.match : 0);
-    const safeWeightSum = activeWeightSum > 0 ? activeWeightSum : 1;
-    const overallFallback = meanOrNeutral(overallSkillMap);
-    const othersFallback = meanOrNeutral(othersSkillMap);
-    const matchFallback = meanOrNeutral(matchSkillMap);
+    const { baseScoreMap, ratingMap } = await buildOverallScoreMaps(clubId, members);
     const rows = members.map((member) => {
-        const overallScore = overallSkillMap.get(member.uid) ?? overallFallback;
-        const othersScore = othersSkillMap.get(member.uid) ?? othersFallback;
-        const matchScore = matchSkillMap.get(member.uid) ?? matchFallback;
-        const weightedScore = ((hasOverall ? DEFAULT_COMPOSITE_WEIGHTS.overall * overallScore : 0) +
-            (hasOthers ? DEFAULT_COMPOSITE_WEIGHTS.others * othersScore : 0) +
-            (hasMatch ? DEFAULT_COMPOSITE_WEIGHTS.match * matchScore : 0)) /
-            safeWeightSum;
-        const hasSignal = overallSkillMap.has(member.uid) || othersSkillMap.has(member.uid) || matchSkillMap.has(member.uid);
+        const baseScore = baseScoreMap.get(member.uid);
+        if (baseScore === undefined) {
+            return {
+                userId: member.uid,
+                score: 0,
+                hasSignal: false,
+            };
+        }
+        const weightedScore = ratingMap.get(member.uid) ?? baseScore;
         return {
             userId: member.uid,
             score: weightedScore,
-            hasSignal,
+            hasSignal: true,
         };
     });
     return sortByScoreWithNameTieBreak(rows, memberNameMap);
@@ -437,40 +478,95 @@ const recomputeClubTierSnapshots = async (clubId, topicId) => {
     return { updatedTierTypes: tierTypes, updatedBoards: topicIds };
 };
 exports.recomputeClubTierSnapshots = recomputeClubTierSnapshots;
-const getTierExplain = async (clubId, userId, tierType) => {
+const deleteCollectionDocs = async (collection) => {
     const db = (0, admin_1.getDb)();
-    const computed = await (0, exports.computeTier)(clubId, tierType);
-    const peer = computed.scores[userId] ?? 0;
-    const matchesSnap = await db.collection("clubs").doc(clubId).collection("matches").get();
-    let wins = 0;
-    let totals = 0;
-    for (const doc of matchesSnap.docs) {
-        const data = doc.data();
-        const challengerId = typeof data.challengerId === "string" ? data.challengerId : "";
-        const opponentId = typeof data.opponentId === "string" ? data.opponentId : "";
-        const winnerId = typeof data.winnerId === "string" ? data.winnerId : "";
-        const status = typeof data.status === "string" ? data.status : "";
-        if (status !== "resolved" || !challengerId || !opponentId || !winnerId) {
-            continue;
+    let deleted = 0;
+    while (true) {
+        const snap = await collection.limit(300).get();
+        if (snap.empty) {
+            break;
         }
-        if (challengerId === userId || opponentId === userId) {
-            totals += 1;
-            if (winnerId === userId) {
-                wins += 1;
-            }
+        const batch = db.batch();
+        for (const doc of snap.docs) {
+            batch.delete(doc.ref);
+            deleted += 1;
         }
+        await batch.commit();
     }
-    const matchResult = totals ? Number(((wins / totals) * 100).toFixed(2)) : peer;
-    const memberDoc = await db.collection("clubs").doc(clubId).collection("members").doc(userId).get();
-    const memberData = memberDoc.data();
-    const match = Number(memberData?.matchScore ?? peer);
-    const score = Number((0, tier_1.average)([peer, matchResult, match]).toFixed(2));
+    return deleted;
+};
+const resetClubTierData = async (clubId, options) => {
+    await (0, firestore_2.ensureClubExists)((0, admin_1.getDb)(), clubId);
+    const includeMatches = options?.includeMatches ?? true;
+    const clubRef = (0, admin_1.getDb)().collection("clubs").doc(clubId);
+    const rootTierListsDeleted = await deleteCollectionDocs(clubRef.collection("tierLists"));
+    const computedTierDeleted = await deleteCollectionDocs(clubRef.collection("computedTier"));
+    const computedTierBoardDeleted = await deleteCollectionDocs(clubRef.collection("computedTierBoard"));
+    const computedTierLocksDeleted = await deleteCollectionDocs(clubRef.collection("computedTierLocks"));
+    const matchesDeleted = includeMatches ? await deleteCollectionDocs(clubRef.collection("matches")) : 0;
+    const topicSnap = await clubRef.collection("tierTopics").get();
+    let topicTierListsDeleted = 0;
+    let tierTopicsDeleted = 0;
+    for (const topicDoc of topicSnap.docs) {
+        topicTierListsDeleted += await deleteCollectionDocs(topicDoc.ref.collection("tierLists"));
+        await topicDoc.ref.delete();
+        tierTopicsDeleted += 1;
+    }
     return {
-        score,
+        includeMatches,
+        deleted: {
+            rootTierLists: rootTierListsDeleted,
+            topicTierLists: topicTierListsDeleted,
+            tierTopics: tierTopicsDeleted,
+            computedTier: computedTierDeleted,
+            computedTierBoard: computedTierBoardDeleted,
+            computedTierLocks: computedTierLocksDeleted,
+            matches: matchesDeleted,
+        },
+    };
+};
+exports.resetClubTierData = resetClubTierData;
+const getTierExplain = async (clubId, userId, tierType) => {
+    if (tierType !== "overall") {
+        const computed = await (0, exports.computeTier)(clubId, tierType);
+        const score = Number((computed.scores[userId] ?? 0).toFixed(2));
+        return {
+            score,
+            details: {
+                tierType,
+                method: "topic_average",
+            },
+        };
+    }
+    const members = await getApprovedMembers(clubId);
+    const { overallSkillMap, othersSkillMap, baseScoreMap, ratingMap, matchStatMap } = await buildOverallScoreMaps(clubId, members);
+    const defaultScoreRaw = overallSkillMap.get(userId);
+    if (defaultScoreRaw === undefined) {
+        return {
+            score: 0,
+            details: {
+                tierType: "overall",
+                hasSignal: false,
+            },
+        };
+    }
+    const othersScoreRaw = othersSkillMap.get(userId);
+    const baseScoreRaw = baseScoreMap.get(userId) ?? defaultScoreRaw;
+    const duelAdjustedRaw = ratingMap.get(userId) ?? baseScoreRaw;
+    const duelDeltaRaw = duelAdjustedRaw - baseScoreRaw;
+    const matchStat = matchStatMap.get(userId) ?? { wins: 0, losses: 0, total: 0 };
+    return {
+        score: Number((duelAdjustedRaw * 100).toFixed(2)),
         details: {
-            peer: Number(peer.toFixed(2)),
-            matchResult,
-            match,
+            tierType: "overall",
+            hasSignal: true,
+            defaultScore: Number((defaultScoreRaw * 100).toFixed(2)),
+            othersScore: othersScoreRaw === undefined ? null : Number((othersScoreRaw * 100).toFixed(2)),
+            baseScore: Number((baseScoreRaw * 100).toFixed(2)),
+            duelAdjustedScore: Number((duelAdjustedRaw * 100).toFixed(2)),
+            duelDelta: Number((duelDeltaRaw * 100).toFixed(2)),
+            duelK: Number((MATCH_ELO_K * 100).toFixed(2)),
+            matches: matchStat,
         },
     };
 };
