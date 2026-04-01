@@ -18,6 +18,11 @@ type ParsedTierEntry = {
   tier: number;
 };
 
+type TierListPayload = {
+  evaluatorId: string;
+  data: unknown;
+};
+
 type ApprovedMember = {
   uid: string;
   name: string;
@@ -44,7 +49,13 @@ const DEFAULT_COMPOSITE_WEIGHTS: CompositeRankWeights = {
 const CACHE_MS = Number(process.env.COMPUTED_TIER_CACHE_MS ?? 300000);
 const LOCK_MS = Number(process.env.COMPUTED_TIER_LOCK_MS ?? 10000);
 
-const parseTierListDoc = (payload: unknown): ParsedTierEntry[] => {
+const MIN_TIER = 0;
+const MAX_TIER = 9;
+
+const isValidTierNumber = (value: number) =>
+  Number.isInteger(value) && value >= MIN_TIER && value <= MAX_TIER;
+
+const parseTierListDoc = ({ evaluatorId, data: payload }: TierListPayload): ParsedTierEntry[] => {
   const rows: ParsedTierEntry[] = [];
   if (!payload || typeof payload !== "object") {
     return rows;
@@ -62,7 +73,7 @@ const parseTierListDoc = (payload: unknown): ParsedTierEntry[] => {
     }
     for (const [tierKey, rawUsers] of Object.entries(record)) {
       const tierNumber = Number(tierKey);
-      if (!Number.isFinite(tierNumber)) {
+      if (!isValidTierNumber(tierNumber)) {
         continue;
       }
       if (!Array.isArray(rawUsers)) {
@@ -70,6 +81,9 @@ const parseTierListDoc = (payload: unknown): ParsedTierEntry[] => {
       }
       for (const rawUser of rawUsers) {
         if (typeof rawUser !== "string" || !rawUser) {
+          continue;
+        }
+        if (evaluatorId && rawUser === evaluatorId) {
           continue;
         }
         rows.push({ userId: rawUser, tier: tierNumber });
@@ -84,7 +98,10 @@ const parseTierListDoc = (payload: unknown): ParsedTierEntry[] => {
     for (const row of data.rankings) {
       const userId = typeof row.userId === "string" ? row.userId : "";
       const tier = Number(row.tier);
-      if (!userId || !Number.isFinite(tier)) {
+      if (!userId || !isValidTierNumber(tier)) {
+        continue;
+      }
+      if (evaluatorId && userId === evaluatorId) {
         continue;
       }
       rows.push({ userId, tier });
@@ -189,12 +206,12 @@ const getApprovedMembers = async (clubId: string): Promise<ApprovedMember[]> => 
     .map((member) => ({ uid: member.uid, name: member.name }));
 };
 
-const getTierListPayloadsByTopic = async (clubId: string, topicId: string): Promise<unknown[]> => {
+const getTierListPayloadsByTopic = async (clubId: string, topicId: string): Promise<TierListPayload[]> => {
   const db = getDb();
 
   if (topicId !== "default") {
     const snap = await db.collection("clubs").doc(clubId).collection("tierTopics").doc(topicId).collection("tierLists").get();
-    return snap.docs.map((doc) => doc.data());
+    return snap.docs.map((doc) => ({ evaluatorId: doc.id, data: doc.data() }));
   }
 
   const defaultTopicSnap = await db
@@ -206,14 +223,14 @@ const getTierListPayloadsByTopic = async (clubId: string, topicId: string): Prom
     .get();
 
   if (!defaultTopicSnap.empty) {
-    return defaultTopicSnap.docs.map((doc) => doc.data());
+    return defaultTopicSnap.docs.map((doc) => ({ evaluatorId: doc.id, data: doc.data() }));
   }
 
   const rootSnap = await db.collection("clubs").doc(clubId).collection("tierLists").get();
-  return rootSnap.docs.map((doc) => doc.data());
+  return rootSnap.docs.map((doc) => ({ evaluatorId: doc.id, data: doc.data() }));
 };
 
-const buildTierSkillMap = (tierPayloads: unknown[], memberSet: Set<string>) => {
+const buildTierSkillMap = (tierPayloads: TierListPayload[], memberSet: Set<string>) => {
   const scoreMap = new Map<string, { sum: number; count: number }>();
 
   for (const payload of tierPayloads) {
@@ -287,7 +304,7 @@ const buildWeightedOtherTopicSkillMap = async (
   return result;
 };
 
-const buildAverageTierMap = (tierPayloads: unknown[], memberSet: Set<string>) => {
+const buildAverageTierMap = (tierPayloads: TierListPayload[], memberSet: Set<string>) => {
   const scoreMap = new Map<string, { sum: number; count: number }>();
 
   for (const payload of tierPayloads) {
