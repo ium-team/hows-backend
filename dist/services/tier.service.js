@@ -34,20 +34,33 @@ const parseTierListDoc = ({ evaluatorId, data: payload }) => {
             if (!Array.isArray(rawUsers)) {
                 continue;
             }
-            for (const rawUser of rawUsers) {
+            const tierGroupSize = rawUsers.length;
+            for (const [index, rawUser] of rawUsers.entries()) {
                 if (typeof rawUser !== "string" || !rawUser) {
                     continue;
                 }
                 if (evaluatorId && rawUser === evaluatorId) {
                     continue;
                 }
-                rows.push({ userId: rawUser, tier: tierNumber });
+                // Preserve ordering inside the same tier by giving earlier users a slightly better (lower) value.
+                // Keeps strict tier boundaries because the offset is always in [0, 1).
+                const intraTierOffset = tierGroupSize > 0 ? index / tierGroupSize : 0;
+                rows.push({ userId: rawUser, tier: tierNumber, tierValue: tierNumber + intraTierOffset });
             }
         }
     };
     parseTierRecord(data.tiers);
     parseTierRecord(data.tierMap);
     if (Array.isArray(data.rankings)) {
+        const tierCounts = new Map();
+        for (const row of data.rankings) {
+            const tier = Number(row.tier);
+            if (!isValidTierNumber(tier)) {
+                continue;
+            }
+            tierCounts.set(tier, (tierCounts.get(tier) ?? 0) + 1);
+        }
+        const tierSeen = new Map();
         for (const row of data.rankings) {
             const userId = typeof row.userId === "string" ? row.userId : "";
             const tier = Number(row.tier);
@@ -57,7 +70,11 @@ const parseTierListDoc = ({ evaluatorId, data: payload }) => {
             if (evaluatorId && userId === evaluatorId) {
                 continue;
             }
-            rows.push({ userId, tier });
+            const seen = tierSeen.get(tier) ?? 0;
+            const count = tierCounts.get(tier) ?? 1;
+            const intraTierOffset = count > 0 ? seen / count : 0;
+            tierSeen.set(tier, seen + 1);
+            rows.push({ userId, tier, tierValue: tier + intraTierOffset });
         }
     }
     return rows;
@@ -163,7 +180,7 @@ const buildTierSkillMap = (tierPayloads, memberSet) => {
                 continue;
             }
             const prev = scoreMap.get(row.userId) ?? { sum: 0, count: 0 };
-            scoreMap.set(row.userId, { sum: prev.sum + row.tier, count: prev.count + 1 });
+            scoreMap.set(row.userId, { sum: prev.sum + row.tierValue, count: prev.count + 1 });
         }
     }
     const skillMap = new Map();
@@ -220,7 +237,7 @@ const buildAverageTierMap = (tierPayloads, memberSet) => {
                 continue;
             }
             const prev = scoreMap.get(row.userId) ?? { sum: 0, count: 0 };
-            scoreMap.set(row.userId, { sum: prev.sum + row.tier, count: prev.count + 1 });
+            scoreMap.set(row.userId, { sum: prev.sum + row.tierValue, count: prev.count + 1 });
         }
     }
     const avgMap = new Map();
