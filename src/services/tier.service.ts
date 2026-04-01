@@ -611,6 +611,64 @@ export const recomputeClubTierSnapshots = async (clubId: string, topicId?: strin
   return { updatedTierTypes: tierTypes, updatedBoards: topicIds };
 };
 
+const deleteCollectionDocs = async (
+  collection: FirebaseFirestore.CollectionReference<FirebaseFirestore.DocumentData>,
+) => {
+  const db = getDb();
+  let deleted = 0;
+
+  while (true) {
+    const snap = await collection.limit(300).get();
+    if (snap.empty) {
+      break;
+    }
+
+    const batch = db.batch();
+    for (const doc of snap.docs) {
+      batch.delete(doc.ref);
+      deleted += 1;
+    }
+    await batch.commit();
+  }
+
+  return deleted;
+};
+
+export const resetClubTierData = async (clubId: string, options?: { includeMatches?: boolean }) => {
+  await ensureClubExists(getDb(), clubId);
+
+  const includeMatches = options?.includeMatches ?? true;
+  const clubRef = getDb().collection("clubs").doc(clubId);
+
+  const rootTierListsDeleted = await deleteCollectionDocs(clubRef.collection("tierLists"));
+  const computedTierDeleted = await deleteCollectionDocs(clubRef.collection("computedTier"));
+  const computedTierBoardDeleted = await deleteCollectionDocs(clubRef.collection("computedTierBoard"));
+  const computedTierLocksDeleted = await deleteCollectionDocs(clubRef.collection("computedTierLocks"));
+  const matchesDeleted = includeMatches ? await deleteCollectionDocs(clubRef.collection("matches")) : 0;
+
+  const topicSnap = await clubRef.collection("tierTopics").get();
+  let topicTierListsDeleted = 0;
+  let tierTopicsDeleted = 0;
+  for (const topicDoc of topicSnap.docs) {
+    topicTierListsDeleted += await deleteCollectionDocs(topicDoc.ref.collection("tierLists"));
+    await topicDoc.ref.delete();
+    tierTopicsDeleted += 1;
+  }
+
+  return {
+    includeMatches,
+    deleted: {
+      rootTierLists: rootTierListsDeleted,
+      topicTierLists: topicTierListsDeleted,
+      tierTopics: tierTopicsDeleted,
+      computedTier: computedTierDeleted,
+      computedTierBoard: computedTierBoardDeleted,
+      computedTierLocks: computedTierLocksDeleted,
+      matches: matchesDeleted,
+    },
+  };
+};
+
 export const getTierExplain = async (clubId: string, userId: string, tierType: TierType) => {
   const db = getDb();
   const computed = await computeTier(clubId, tierType);

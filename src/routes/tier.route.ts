@@ -6,6 +6,7 @@ import {
   computeTier,
   computeTierBoard,
   getTierExplain,
+  resetClubTierData,
   recomputeClubTierSnapshots,
   TierType,
 } from "../services/tier.service";
@@ -29,6 +30,11 @@ const boardSchema = z.object({
 const recomputeSchema = z.object({
   clubId: z.string().min(1),
   topicId: z.string().min(1).optional(),
+});
+
+const resetSchema = z.object({
+  clubId: z.string().min(1),
+  includeMatches: z.boolean().optional(),
 });
 
 export const registerTierRoutes = async (fastify: FastifyInstance) => {
@@ -58,5 +64,11 @@ export const registerTierRoutes = async (fastify: FastifyInstance) => {
     const body = recomputeSchema.parse(request.body);
     await ensureOwner(getDb(), body.clubId, request.userId!);
     return recomputeClubTierSnapshots(body.clubId, body.topicId);
+  });
+
+  fastify.post("/reset", async (request) => {
+    const body = resetSchema.parse(request.body);
+    await ensureOwner(getDb(), body.clubId, request.userId!);
+    return resetClubTierData(body.clubId, { includeMatches: body.includeMatches });
   });
 };
