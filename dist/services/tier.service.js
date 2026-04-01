@@ -200,7 +200,13 @@ const parseTopicWeight = (rawWeight) => {
 };
 const buildWeightedOtherTopicSkillMap = async (clubId, memberSet, topicDocs) => {
     const weightedByMember = new Map();
-    const additionalTopicDocs = topicDocs.filter((topicDoc) => topicDoc.id !== "default");
+    const additionalTopicDocs = topicDocs.filter((topicDoc) => {
+        if (topicDoc.id === "default") {
+            return false;
+        }
+        const rawIsActive = topicDoc.data()?.isActive;
+        return typeof rawIsActive === "boolean" ? rawIsActive : true;
+    });
     if (!additionalTopicDocs.length) {
         return new Map();
     }
@@ -529,6 +535,8 @@ const resetClubTierData = async (clubId, options) => {
         await topicDoc.ref.delete();
         tierTopicsDeleted += 1;
     }
+    // `default` 부모 문서가 없는 상태에서도 subcollection 데이터는 남을 수 있으므로 명시적으로 정리한다.
+    topicTierListsDeleted += await deleteCollectionDocs(clubRef.collection("tierTopics").doc("default").collection("tierLists"));
     return {
         includeMatches,
         deleted: {

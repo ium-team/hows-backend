@@ -289,7 +289,13 @@ const buildWeightedOtherTopicSkillMap = async (
   topicDocs: FirebaseFirestore.QueryDocumentSnapshot<FirebaseFirestore.DocumentData>[],
 ) => {
   const weightedByMember = new Map<string, { weightedSum: number; weightSum: number }>();
-  const additionalTopicDocs = topicDocs.filter((topicDoc) => topicDoc.id !== "default");
+  const additionalTopicDocs = topicDocs.filter((topicDoc) => {
+    if (topicDoc.id === "default") {
+      return false;
+    }
+    const rawIsActive = topicDoc.data()?.isActive;
+    return typeof rawIsActive === "boolean" ? rawIsActive : true;
+  });
   if (!additionalTopicDocs.length) {
     return new Map<string, number>();
   }
@@ -718,6 +724,8 @@ export const resetClubTierData = async (clubId: string, options?: { includeMatch
     await topicDoc.ref.delete();
     tierTopicsDeleted += 1;
   }
+  // `default` 부모 문서가 없는 상태에서도 subcollection 데이터는 남을 수 있으므로 명시적으로 정리한다.
+  topicTierListsDeleted += await deleteCollectionDocs(clubRef.collection("tierTopics").doc("default").collection("tierLists"));
 
   return {
     includeMatches,
